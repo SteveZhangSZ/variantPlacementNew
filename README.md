@@ -1,0 +1,1 @@
+This is my implementation of variant AKA tagged union. This is a work in progress; some features and methods are missing, but the important ones have so far been included.
