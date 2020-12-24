@@ -80,10 +80,6 @@ template <class T> struct variant_size<volatile T> : std::integral_constant<std:
 template <class T> struct variant_size<const volatile T> : std::integral_constant<std::size_t, 1>{};
 //end variant size
 
-
-//template<class... Ts> struct variant : variantImpl<otherIdxSeq::make_index_sequence<sizeof...(Ts)>, Ts...>{};
-
-
 template<std::size_t... Idx, typename... Ts>
 class variantImpl<otherIdxSeq::index_sequence<Idx...>, Ts...> :public variant_alternative<Idx,Ts>...{
     static_assert( !(std::is_same<void, typename std::remove_cv<Ts>::type>::value || ...) , "No void in variant!");
@@ -105,6 +101,7 @@ class variantImpl<otherIdxSeq::index_sequence<Idx...>, Ts...> :public variant_al
     explicit constexpr variantImpl(valuelessCtor) : typeIndex{static_cast<std::size_t>(-1)}{}
     public:
     typedef otherIdxSeq::index_sequence<Idx...> theIdxSeq;
+    static constexpr bool allTrivDestruct = (std::is_trivially_destructible<Ts>::value && ...);
     //constructors
 
     constexpr variantImpl(){
@@ -256,7 +253,7 @@ F&& f, Vs&& ... vs){
 }
 
 
-namespace forSingleVisitor{
+namespace visitHelpers{
     class emptyClass{};
     #define CELLCTORMACRO emptyClass forConstexprCtor;\
     T theNode;\
@@ -271,10 +268,14 @@ namespace forSingleVisitor{
     template<class T> union Cell<T,false> {
         CELLCTORMACRO
         ~Cell(){
-            theNode.~T(); //By end of fold expression in singleVisitor, theNode will be the active member
+            theNode.~T(); //By end of the fold expression, theNode will be the active member
         }
     };
     #undef CELLCTORMACRO
+    template<std::size_t whichIdx, std::size_t N, std::size_t... Indices,std::size_t... indexSeqNums>
+    constexpr auto changedIdxSeq(otherIdxSeq::index_sequence<indexSeqNums...>){
+        return otherIdxSeq::index_sequence<(whichIdx == indexSeqNums ? N : Indices)...>{};
+    }
 }
 
 
@@ -283,40 +284,79 @@ constexpr decltype(auto) //std::invoke_result_t<F, variant_alternative_t<0,std::
 singleVisitor(F&& f, otherIdxSeq::index_sequence<indexSeqNums...>, Vs&& vs){
     typedef std::invoke_result_t<F, variant_alternative_t<0,std::remove_reference_t<Vs>>> returnType;
     if constexpr(std::is_void<returnType>::value){
-        static_cast<void>( ((vs.index() == indexSeqNums ? ( std::invoke(static_cast<F&&>(f), get_unchecked<indexSeqNums>(static_cast<Vs&&>(vs) ) ), true )
-        : false ) || ...) );
+        static_cast<void>( ((vs.index() == indexSeqNums && ( std::invoke(static_cast<F&&>(f), get_unchecked<indexSeqNums>(static_cast<Vs&&>(vs) ) ), true )) || ...) );
     }
     else if constexpr(std::is_trivially_copy_assignable<returnType>::value){
-        forSingleVisitor::Cell<returnType,std::is_trivially_destructible<Vs>::value> hasResult;
-        ( (vs.index() == indexSeqNums ? 
-        (hasResult = forSingleVisitor::Cell<returnType,std::is_trivially_destructible<Vs>::value>{std::invoke(static_cast<F&&>(f), get_unchecked<indexSeqNums>(static_cast<Vs&&>(vs) ) )}, true ) 
-        : false) || ... );
+        visitHelpers::Cell<returnType,std::is_trivially_destructible<Vs>::value> hasResult;
+        ( (vs.index() == indexSeqNums && 
+        (hasResult = visitHelpers::Cell<returnType,std::is_trivially_destructible<Vs>::value>{std::invoke(static_cast<F&&>(f), get_unchecked<indexSeqNums>(static_cast<Vs&&>(vs) ) )}, true )) || ... );
         return hasResult.theNode;
     }
     else{ //else if default constructible. Then copy assign.
         returnType hasResult;
-        ( (vs.index() == indexSeqNums ? 
-        (hasResult = std::invoke(static_cast<F&&>(f), get_unchecked<indexSeqNums>(static_cast<Vs&&>(vs))), true ) 
-        : false) || ... );
+        ( (vs.index() == indexSeqNums && 
+        (hasResult = std::invoke(static_cast<F&&>(f), get_unchecked<indexSeqNums>(static_cast<Vs&&>(vs))), true )) || ... );
         return hasResult;
     }
 }
 
+template<std::size_t whichVariantIdx,
+std::size_t... indexSeqNums, //[0, current variant's number of types)
+std::size_t... Indices, //for get_unchecked
+class F,
+typename... Vs> constexpr decltype(auto)
+visitWithFoldExps(const otherIdxSeq::index_sequence<indexSeqNums...> theISN,
+const otherIdxSeq::index_sequence<Indices...> theIdxSeq,
+F&& f, Vs&& ... vs){
+    typedef std::invoke_result_t<F, variant_alternative_t<0,std::remove_reference_t<Vs>>... > returnType;
+   
+    #define SZVISITFUNCTIONCALL visitWithFoldExps<whichVariantIdx + 1>(otherIdxSeq::make_index_sequence<getNextVarIdx(whichVariantIdx + 1,variant_size<Vs>::value...)>{},visitHelpers::changedIdxSeq<whichVariantIdx, indexSeqNums,Indices...>(otherIdxSeq::make_index_sequence<sizeof...(vs)>{}),static_cast<F&&>(f), static_cast<Vs&&>(vs)... )
+    
+    //Get the index of the whichVariantIdx'th variant
+    const std::size_t idxToView = getNextVarIdx(whichVariantIdx, vs.index()...);
+
+    if constexpr(whichVariantIdx == sizeof...(vs)){
+        return std::invoke(static_cast<F&&>(f), get_unchecked<Indices>(static_cast<Vs&&>(vs))...);
+    }
+    /*The fold expression compares idxToView to every value of indexSeqNums. indexSeqNums
+    is every whole number in the range [0, whichVariantIdx'th variant's number of types)
+    If the comparison is true, put that index into Indices...
+    Else, check the next index
+    */
+    else if constexpr(std::is_void<returnType>::value){
+        return static_cast<void>(( (idxToView == indexSeqNums && (SZVISITFUNCTIONCALL, true)) || ...  ));
+    }
+    else if constexpr(std::is_trivially_copy_assignable<returnType>::value){
+        typedef visitHelpers::Cell<returnType, getNextVarIdx(whichVariantIdx, std::remove_reference<Vs>::type::allTrivDestruct... ) //check whether the whichVariantIdx'th variant is trivially destructible. TODO: Support for non trivially destructible variants
+        > CellType;
+        CellType theCell;
+        static_cast<void>(( (idxToView == indexSeqNums && (theCell = CellType{SZVISITFUNCTIONCALL}, true)) || ...  ));
+        return theCell.theNode;
+    } else {
+        returnType theCell;
+        static_cast<void>(( (idxToView == indexSeqNums && (theCell = SZVISITFUNCTIONCALL, true)) || ...  ));
+        return theCell;
+    }
+    #undef SZVISITFUNCTIONCALL
+}
 
 template <typename F, typename ... Vs>
 //std::invoke_result_t<F, variant_alternative_t<0,std::remove_reference_t<Vs>>> //return type
 constexpr decltype(auto) visit(F&& f, Vs&& ... vs){
+    typedef std::invoke_result_t<F, variant_alternative_t<0,std::remove_reference_t<Vs>>... > returnType;
+    
     if constexpr(sizeof...(Vs) == 0){
         return std::invoke(static_cast<F&&>(f));
     } 
-    else if constexpr(sizeof...(Vs) == 1){
-        typedef std::invoke_result_t<F, variant_alternative_t<0,std::remove_reference_t<Vs>>... > returnType;
-        static_assert(std::is_void<returnType>::value || std::is_trivially_copy_assignable<returnType>::value
-        || (std::is_default_constructible<returnType>::value && std::is_copy_assignable<returnType>::value),
-        "Function's return type must be void, trivially copy assignable, or default constructible and copy assignable" );
+    else if constexpr(sizeof...(Vs) == 1 && (std::is_void<returnType>::value || std::is_trivially_copy_assignable<returnType>::value
+        || (std::is_default_constructible<returnType>::value && std::is_copy_assignable<returnType>::value))){
         return singleVisitor(static_cast<F&&>(f), (typename Vs::theIdxSeq{})..., vs...);
     }
     else{
+        return visitWithFoldExps<0>(otherIdxSeq::make_index_sequence<getNextVarIdx(0, variant_size<Vs>::value...)>{},
+        otherIdxSeq::index_sequence<(0 & variant_size<Vs>::value)...>{},static_cast<F&&>(f), static_cast<Vs&&>(vs)...);
+
+
         return visitOneIfCheck<0,0>(otherIdxSeq::make_index_sequence<sizeof...(vs)>{},
         otherIdxSeq::index_sequence<(variant_size<Vs>::value - 1)...>{},
         0,static_cast<F&&>(f), static_cast<Vs&&>(vs)...);
